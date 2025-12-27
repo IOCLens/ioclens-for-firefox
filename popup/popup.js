@@ -1,0 +1,2097 @@
+/**
+ * Popup Script V2 - Refactored for maintainability
+ */
+
+// Import logger (loaded via script tag in HTML)
+// Logger is available globally
+
+// Global configuration loaded from chrome.storage
+let API_CONFIG = null;
+
+// ============================================================================
+// API CONFIGURATION - Data-driven approach
+// ============================================================================
+
+const API_REGISTRY = {
+  ipapi: {
+    name: 'ip-api.com',
+    icon: '🌐',
+    supports: ['ipv4'],
+    requiresKey: false,
+    weight: 0, // Geolocation only, no reputation
+    buildUrl: (ioc, key) => {
+      // With API key: use HTTPS pro endpoint, without key: use HTTP free endpoint
+      const protocol = key ? 'https' : 'http';
+      const keyParam = key ? `&key=${key}` : '';
+      return `${protocol}://ip-api.com/json/${ioc}?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,asname,reverse,mobile,proxy,hosting,query${keyParam}`;
+    },
+    buildWebUrl: (ioc) => `https://ip-api.com/#${ioc}`,
+    timeout: 8000 // Increased from 5000 - ip-api.com can be slow
+  },
+  ipapiCo: {
+    name: 'ipapi.co',
+    icon: '🌍',
+    supports: ['ipv4'],
+    requiresKey: false,
+    weight: 0, // Geolocation only, no reputation
+    buildUrl: (ioc, key) => {
+      const keyParam = key ? `?key=${key}` : '';
+      return `https://ipapi.co/${ioc}/json/${keyParam}`;
+    },
+    buildWebUrl: (ioc) => `https://ipapi.co/${ioc}`,
+    timeout: 5000
+  },
+  virustotal: {
+    name: 'VirusTotal',
+    icon: '🦠',
+    supports: ['ipv4', 'domain', 'url', 'sha256'],
+    requiresKey: true,
+    weight: 2.0,
+    // buildUrl receives (iocValue, apiKey, iocType, iocObject) from callAPI
+    // For URLs, we need to query the domain, not the full URL
+    buildUrl: (iocValue, apiKey, type, iocObj) => {
+      if (type === 'ipv4') {
+        return `https://www.virustotal.com/api/v3/ip_addresses/${iocValue}`;
+      } else if (type === 'sha256') {
+        return `https://www.virustotal.com/api/v3/files/${iocValue}`;
+      } else if (type === 'url' && iocObj?.domain) {
+        // For URLs, query the domain
+        return `https://www.virustotal.com/api/v3/domains/${iocObj.domain}`;
+      } else {
+        // For domains, query directly
+        return `https://www.virustotal.com/api/v3/domains/${iocValue}`;
+      }
+    },
+    buildWebUrl: (ioc, type) => {
+      if (type === 'ipv4') {
+        return `https://www.virustotal.com/gui/ip-address/${ioc}`;
+      } else if (type === 'sha256') {
+        return `https://www.virustotal.com/gui/file/${ioc}`;
+      } else {
+        return `https://www.virustotal.com/gui/domain/${ioc}`;
+      }
+    },
+    headers: (key) => ({ 'x-apikey': key }),
+    timeout: 8000,
+    parseResponse: (data) => data.data
+  },
+  abuseipdb: {
+    name: 'AbuseIPDB',
+    icon: '⚠️',
+    supports: ['ipv4'],
+    requiresKey: true,
+    weight: 1.5,
+    buildUrl: (ioc) => `https://api.abuseipdb.com/api/v2/check?ipAddress=${ioc}&maxAgeInDays=90&verbose`,
+    buildWebUrl: (ioc) => `https://www.abuseipdb.com/check/${ioc}`,
+    headers: (key) => ({ 'Key': key, 'Accept': 'application/json' }),
+    timeout: 5000,
+    parseResponse: (data) => data.data
+  },
+  shodan: {
+    name: 'Shodan',
+    icon: '🔎',
+    supports: ['ipv4'],
+    requiresKey: true,
+    weight: 1.0,
+    buildUrl: (ioc, key) => `https://api.shodan.io/shodan/host/${ioc}?key=${key}`,
+    buildWebUrl: (ioc) => `https://www.shodan.io/host/${ioc}`,
+    timeout: 8000
+  },
+  greynoise: {
+    name: 'GreyNoise',
+    icon: '📡',
+    supports: ['ipv4'],
+    requiresKey: false, // Community API works without key (50 req/week)
+    weight: 1.5,
+    buildUrl: (ioc) => `https://api.greynoise.io/v3/community/${ioc}`,
+    buildWebUrl: (ioc) => `https://viz.greynoise.io/ip/${ioc}`,
+    headers: (key) => key ? { 'key': key } : {},
+    timeout: 5000
+  },
+  urlhaus: {
+    name: 'URLhaus',
+    icon: '🔗',
+    supports: ['domain', 'url', 'sha256'],
+    requiresKey: true,
+    weight: 2.0,
+    buildUrl: (iocValue, apiKey, type) => {
+      if (type === 'sha256') {
+        return 'https://urlhaus-api.abuse.ch/v1/payload/';
+      }
+      return 'https://urlhaus-api.abuse.ch/v1/host/';
+    },
+    buildWebUrl: (ioc) => `https://urlhaus.abuse.ch/browse.php?search=${ioc}`,
+    method: 'POST',
+    headers: (key) => ({
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Auth-Key': key
+    }),
+    buildBody: (iocValue, apiKey, type, iocObj) => {
+      if (type === 'sha256') {
+        return `sha256_hash=${encodeURIComponent(iocValue)}`;
+      }
+      const host = type === 'url' && iocObj?.domain ? iocObj.domain : iocValue;
+      return `host=${encodeURIComponent(host)}`;
+    },
+    timeout: 5000
+  },
+  threatfox: {
+    name: 'ThreatFox',
+    icon: '🦊',
+    supports: ['ipv4', 'domain', 'url', 'sha256'],
+    requiresKey: true,
+    weight: 2.0, // abuse.ch curated blacklist - high confidence like URLhaus
+    buildUrl: () => 'https://threatfox-api.abuse.ch/api/v1/',
+    buildWebUrl: (ioc) => `https://threatfox.abuse.ch/browse.php?search=ioc%3A${ioc}`,
+    method: 'POST',
+    headers: (key) => ({
+      'Content-Type': 'application/json',
+      'Auth-Key': key
+    }),
+    buildBody: (ioc) => JSON.stringify({ query: 'search_ioc', search_term: ioc }),
+    timeout: 5000
+  },
+  otx: {
+    name: 'AlienVault OTX',
+    icon: '👽',
+    supports: ['domain', 'ipv4', 'sha256'],
+    requiresKey: true,
+    weight: 1.2,
+    buildUrl: (ioc, key, type) => {
+      let indicator;
+      if (type === 'ipv4') {
+        indicator = 'IPv4';
+      } else if (type === 'sha256') {
+        indicator = 'file';
+      } else {
+        indicator = 'domain';
+      }
+      return `https://otx.alienvault.com/api/v1/indicators/${indicator}/${ioc}/general`;
+    },
+    buildWebUrl: (ioc, type) => {
+      let indicator;
+      if (type === 'ipv4') {
+        indicator = 'IPv4';
+      } else if (type === 'sha256') {
+        indicator = 'file';
+      } else {
+        indicator = 'domain';
+      }
+      return `https://otx.alienvault.com/indicator/${indicator}/${ioc}`;
+    },
+    headers: (key) => ({ 'X-OTX-API-KEY': key }),
+    timeout: 8000
+  }
+};
+
+const VERDICT_RULES = {
+  virustotal: (data) => {
+    const stats = data.attributes?.last_analysis_stats;
+    if (!stats) return { verdict: 'unknown', score: 0, detail: 'No analysis data' };
+
+    const malicious = stats.malicious || 0;
+    const suspicious = stats.suspicious || 0;
+    const total = malicious + suspicious + (stats.undetected || 0) + (stats.harmless || 0);
+
+    if (malicious > 5) return { verdict: 'malicious', score: 100, detail: `${malicious}/${total} vendors` };
+    if (malicious > 0 || suspicious > 3) return { verdict: 'suspicious', score: 50, detail: `${malicious}/${total} malicious, ${suspicious}/${total} suspicious` };
+    return { verdict: 'clean', score: 0, detail: `0/${total} detections` };
+  },
+
+  abuseipdb: (data) => {
+    const score = data.abuseConfidenceScore || 0;
+    const reports = data.totalReports || 0;
+
+    if (score > 75) return { verdict: 'malicious', score, detail: `${score}% confidence, ${reports} reports` };
+    if (score > 25) return { verdict: 'suspicious', score, detail: `${score}% confidence, ${reports} reports` };
+    return { verdict: 'clean', score, detail: reports > 0 ? `${reports} reports, ${score}% confidence` : 'No abuse reports' };
+  },
+
+  greynoise: (data) => {
+    const classMap = {
+      malicious: { verdict: 'malicious', score: 100, detail: data.name || 'Malicious activity' },
+      benign: { verdict: 'clean', score: 0, detail: 'Benign scanner' },
+      unknown: { verdict: 'clean', score: 0, detail: `Actor: ${data.actor || 'unknown'} - Not classified as threat` }
+    };
+    return classMap[data.classification] || { verdict: 'clean', score: 0, detail: 'Not seen' };
+  },
+
+  urlhaus: (data) => {
+    // URLhaus is a blacklist only - "not found" doesn't mean clean, it means unknown
+    if (data.query_status === 'ok') {
+      // For hosts: check urlhaus_reference, for payloads: check sha256_hash or urls
+      if (data.urlhaus_reference || data.sha256_hash || (data.urls && data.urls.length > 0)) {
+        return { verdict: 'malicious', score: 100, detail: 'Listed in malware database' };
+      }
+    }
+    return { verdict: 'unknown', score: 0, detail: 'Not in database (blacklist only)' };
+  },
+
+  shodan: (data) => {
+    const vulns = data.vulns ? Object.keys(data.vulns).length : 0;
+    const ports = Array.isArray(data.ports) ? data.ports.length : 0;
+    const services = Array.isArray(data.data) ? data.data.length : 0;
+
+    if (vulns > 5) return { verdict: 'suspicious', score: 70, detail: `${vulns} known CVEs, ${ports} open ports` };
+    if (vulns > 0) return { verdict: 'suspicious', score: 40, detail: `${vulns} known CVE(s), ${ports} open ports` };
+
+    // If we have data about the host (ports/services), it means Shodan found it
+    if (ports > 0 || services > 0) {
+      const details = [];
+      if (ports > 0) details.push(`${ports} open port(s)`);
+      if (data.org) details.push(`Org: ${data.org}`);
+      if (data.os) details.push(`OS: ${data.os}`);
+      return { verdict: 'clean', score: 0, detail: details.join(', ') || 'Host found, no vulnerabilities' };
+    }
+
+    return { verdict: 'unknown', score: 0, detail: 'No data available' };
+  },
+
+  threatfox: (data) => {
+    // ThreatFox returns { query_status: "ok", data: [...] } or { query_status: "no_result" }
+    // Check if we have valid data array with results
+    if (data && data.data && Array.isArray(data.data) && data.data.length > 0) {
+      const iocCount = data.data.length;
+      // Get confidence level from first IOC if available
+      const firstIoc = data.data[0];
+      const confidenceLevel = firstIoc?.confidence_level || 'unknown';
+      return { verdict: 'malicious', score: 100, detail: `${iocCount} IOC(s) - ${confidenceLevel} confidence` };
+    }
+    // Check for explicit "ok" status with no data
+    if (data && data.query_status === 'ok') {
+      return { verdict: 'unknown', score: 0, detail: 'Found but no IOCs' };
+    }
+    // "no_result" or no data
+    return { verdict: 'unknown', score: 0, detail: 'Not in database (blacklist only)' };
+  },
+
+  otx: (data) => {
+    // AlienVault OTX general endpoint returns pulse_info with count
+    const pulseCount = data.pulse_info?.count || 0;
+    if (pulseCount > 10) return { verdict: 'malicious', score: 90, detail: `Found in ${pulseCount} threat reports` };
+    if (pulseCount > 3) return { verdict: 'suspicious', score: 60, detail: `Found in ${pulseCount} threat reports` };
+    if (pulseCount > 0) return { verdict: 'suspicious', score: 30, detail: `Found in ${pulseCount} threat report(s)` };
+    return { verdict: 'clean', score: 0, detail: 'Not in threat reports' };
+  }
+};
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+document.addEventListener('DOMContentLoaded', async () => {
+  console.log('[Popup] Initialisation...');
+  await Logger.logUI('Popup opened');
+
+  // Load theme preference
+  await loadTheme();
+
+  await loadAPIConfig();
+
+  // Check and display PRO status
+  const isProUser = await checkProStatus();
+  updateUIForProStatus(isProUser);
+
+  const data = await safeStorageGet(['currentIOC']);
+
+  if (data.currentIOC) {
+    console.log('[Popup] IOC trouvé:', data.currentIOC);
+    await Logger.logIOC('IOC loaded from storage', data.currentIOC);
+    displayIOC(data.currentIOC);
+    await enrichIOC(data.currentIOC);
+  } else {
+    await Logger.logUI('No IOC selected', { error: 'User needs to select text' });
+    showError('No IOC selected. Right-click on an IP address or domain to analyze it.');
+  }
+
+  document.getElementById('copy-json').addEventListener('click', copyJSON);
+  document.getElementById('refresh').addEventListener('click', refreshData);
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+
+  // License management event listeners
+  document.getElementById('gumroad-purchase').addEventListener('click', openGumroadPurchase);
+  document.getElementById('activate-license').addEventListener('click', activateLicenseKey);
+
+  // Show license input when clicking on pro banner
+  const proBanner = document.querySelector('.pro-banner');
+  if (proBanner && !isProUser) {
+    proBanner.addEventListener('dblclick', () => {
+      document.getElementById('license-section').classList.toggle('hidden');
+    });
+  }
+});
+
+async function loadAPIConfig() {
+  try {
+    const result = await safeStorageGet(['apiConfig', 'proLicenseKey']);
+    const isProUser = !!result.proLicenseKey;
+
+    if (result.apiConfig) {
+      // SECURITY: Decrypt API keys before use
+      // Keys are stored encrypted in chrome.storage.local to prevent theft
+      API_CONFIG = await CryptoUtils.decryptConfig(result.apiConfig);
+      console.log('[Config] Configuration chargée et décryptée');
+    } else {
+      // Default config: Free users only get VirusTotal
+      API_CONFIG = {
+        modules: {
+          ipapi: { enabled: isProUser, key: '' },
+          ipapiCo: { enabled: false, key: '' },
+          virustotal: { enabled: true, key: '' }, // FREE - Always enabled
+          abuseipdb: { enabled: isProUser, key: '' },
+          shodan: { enabled: isProUser, key: '' },
+          urlhaus: { enabled: isProUser, key: '' },
+          threatfox: { enabled: isProUser, key: '' },
+          otx: { enabled: isProUser, key: '' },
+          greynoise: { enabled: isProUser, key: '' }
+        }
+      };
+      console.log('[Config] Using default config (PRO:', isProUser, ')');
+    }
+
+    // Enforce free tier limitations
+    if (!isProUser) {
+      console.log('[Config] Applying FREE tier restrictions');
+      // Only VirusTotal is enabled for free users
+      for (const [apiName, config] of Object.entries(API_CONFIG.modules)) {
+        if (apiName !== 'virustotal') {
+          config.enabled = false;
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[Config] Load error:', error);
+    // Fallback to free tier config on error
+    API_CONFIG = {
+      modules: {
+        ipapi: { enabled: false, key: '' },
+        ipapiCo: { enabled: false, key: '' },
+        virustotal: { enabled: true, key: '' },
+        abuseipdb: { enabled: false, key: '' },
+        shodan: { enabled: false, key: '' },
+        urlhaus: { enabled: false, key: '' },
+        threatfox: { enabled: false, key: '' },
+        otx: { enabled: false, key: '' },
+        greynoise: { enabled: false, key: '' }
+      }
+    };
+  }
+}
+
+// ============================================================================
+// CORE API CLIENT
+// ============================================================================
+
+async function callAPI(apiName, ioc) {
+  const spec = API_REGISTRY[apiName];
+  if (!spec) throw new Error(`Unknown API: ${apiName}`);
+
+  const iocValue = ioc.value;
+  const iocType = ioc.type;
+
+  const config = API_CONFIG.modules[apiName];
+  if (!config.enabled) return null;
+  if (!spec.supports.includes(iocType)) return null;
+
+  // Check rate limit before making API call
+  try {
+    const rateLimitCheck = await chrome.runtime.sendMessage({ action: 'checkRateLimit' });
+    if (rateLimitCheck && !rateLimitCheck.allowed) {
+      throw new Error(`Rate limit exceeded (${rateLimitCheck.status.available}/${rateLimitCheck.status.max} tokens). Please wait before retrying.`);
+    }
+  } catch (rateLimitError) {
+    // If rate limiting fails, log but continue (fail open for now)
+    console.warn('[Rate Limit] Check failed, continuing anyway:', rateLimitError);
+  }
+
+  // Pass iocValue, apiKey, iocType, and full ioc object to buildUrl
+  const url = spec.buildUrl(iocValue, config.key, iocType, ioc);
+  const method = spec.method || 'GET';
+
+  // Build headers - only call headers function if we have a key OR if API doesn't require one
+  let headers = {};
+  if (spec.headers) {
+    if (spec.requiresKey && config.key) {
+      headers = spec.headers(config.key);
+    } else if (!spec.requiresKey) {
+      headers = spec.headers();
+    }
+  }
+
+  const body = spec.buildBody ? spec.buildBody(iocValue, config.key, iocType, ioc) : undefined;
+
+  const startTime = Date.now();
+
+  // Log the API request
+  await Logger.logAPIRequest(apiName, url, { method, headers, body });
+
+  try {
+    const response = await fetchWithTimeout(url, {
+      method,
+      headers,
+      body,
+      timeout: spec.timeout
+    });
+
+    const duration = Date.now() - startTime;
+
+    if (!response.ok) {
+      // Try to get error message from response body
+      let errorMessage = null;
+      try {
+        const errorData = await response.json();
+        if (errorData.error) {
+          errorMessage = errorData.error;
+        }
+      } catch (e) {
+        // JSON parsing failed, use generic error
+      }
+
+      const error = errorMessage ? new Error(errorMessage) : createAPIError(response.status, apiName);
+      if (error) {
+        // Don't log normal API responses like rate limits (429) or permission errors (403) as errors
+        // These are expected responses that we handle gracefully in the UI
+        const isExpectedError = response.status === 429 || response.status === 403;
+        if (!isExpectedError) {
+          await Logger.logAPIError(apiName, error, { status: response.status, duration });
+        }
+        throw error;
+      }
+      // If error is null, it means no data available (404), which is normal - not an error
+      await Logger.logAPIResponse(apiName, true, { noData: true, reason: 'No information available (normal)', status: 404 }, duration);
+      return null;
+    }
+
+    const data = await response.json();
+
+    // Only reject if it's an actual error (not just "no results found")
+    if (data.status === 'fail') {
+      const error = new Error(data.message || 'API request failed');
+      // Don't log rate limit errors as they are expected and displayed in UI
+      const isRateLimitError = data.message && data.message.toLowerCase().includes('rate limit');
+      if (!isRateLimitError) {
+        await Logger.logAPIError(apiName, error, { responseData: data, duration });
+      }
+      throw error;
+    }
+    if (data.error && data.query_status !== 'no_result') {
+      const error = new Error(data.reason || data.error || 'API error');
+      // Don't log expected API limitations (rate limits, membership requirements, etc.)
+      const errorMsg = error.message.toLowerCase();
+      const isExpectedError = errorMsg.includes('rate limit') ||
+                              errorMsg.includes('membership') ||
+                              errorMsg.includes('upgrade') ||
+                              errorMsg.includes('quota');
+      if (!isExpectedError) {
+        await Logger.logAPIError(apiName, error, { responseData: data, duration });
+      }
+      throw error;
+    }
+
+    const result = spec.parseResponse ? spec.parseResponse(data) : data;
+    await Logger.logAPIResponse(apiName, true, result, duration);
+
+    return result;
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    // Don't log "API key not configured" as an error for optional APIs
+    const isKeyError = error.message === 'API key not configured';
+    const shouldLogError = !isKeyError || spec.requiresKey;
+
+    if (shouldLogError) {
+      await Logger.logAPIError(apiName, error, { duration });
+    }
+    throw error;
+  }
+}
+
+function createAPIError(status, apiName) {
+  // 404 means no data found, not an error - this is normal
+  if (status === 404) {
+    return null; // Not an error, just no information available
+  }
+
+  // Special handling for ip-api.com which uses 403 for rate limiting
+  if (apiName === 'ipapi' && status === 403) {
+    return new Error('Rate limit exceeded (45 req/min)');
+  }
+
+  if (status === 401 || status === 403) return new Error('Invalid or missing API key');
+  if (status === 422) return new Error('Invalid input format');
+  if (status === 429) return new Error('Rate limit exceeded');
+  if (status >= 500) return new Error(`${apiName} service temporarily unavailable`);
+  return new Error(`API error (HTTP ${status})`);
+}
+
+// ============================================================================
+// ENRICHMENT ORCHESTRATION
+// ============================================================================
+
+async function enrichIOC(ioc) {
+  showLoading();
+  hideError();
+  hideResults();
+
+  await Logger.logEnrichment('Starting enrichment', { ioc });
+
+  try {
+    // SECURITY: Use SHA-256 hash for cache key to prevent collisions
+    // Normalize IOC value and use explicit namespace
+    const normalizedValue = ioc.value.toLowerCase().trim();
+    const hash = await generateSHA256(normalizedValue);
+    const cacheKey = `enrichment_${ioc.type}_${hash}`;
+    const cached = await getCachedData(cacheKey);
+
+    if (cached) {
+      console.log('[Popup] Using cache for:', cacheKey);
+      await Logger.logCache('Cache hit', cacheKey, true);
+      displayResults(cached);
+      return;
+    }
+
+    await Logger.logCache('Cache miss', cacheKey, false);
+
+    // Use the actual IOC type (ipv4, domain, or url) and pass full IOC object for URLs
+    const enrichedData = await enrichByType(ioc);
+
+    enrichedData.ioc = ioc;
+    enrichedData.timestamp = new Date().toISOString();
+
+    await cacheData(cacheKey, enrichedData);
+    await Logger.logEnrichment('Enrichment completed', {
+      sources: enrichedData.sources,
+      reputation: enrichedData.reputation?.status,
+      threatsCount: enrichedData.threats?.length || 0
+    });
+    displayResults(enrichedData);
+
+  } catch (error) {
+    console.error('[Popup] Enrichment error:', error);
+    await Logger.log('ERROR', 'Enrichment failed', { error: error.message, stack: error.stack });
+    showError(`Error: ${error.message}`);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function enrichByType(ioc) {
+  const iocValue = ioc.value;
+  const iocType = ioc.type;
+
+  console.log(`[Enrichment v2.0] Starting enrichment for ${iocType}:`, iocValue);
+  await Logger.log('ENRICHMENT', `[v2.0] Starting enrichment for ${iocType}`, { iocValue, iocType });
+
+  const results = {
+    type: iocType,
+    value: iocValue,
+    sources: [],
+    apiResults: {},
+    apiErrors: [],
+    reputation: null,
+    threats: [],
+    tags: {
+      malwareFamilies: [],
+      threatTypes: [],
+      categories: [],
+      cves: [],
+      generalTags: [],
+      attackIds: []
+    },
+    technical: {},
+    externalLinks: []
+  };
+
+  if (iocType === 'ipv4') {
+    results.geolocation = null;
+  }
+
+  const promises = buildAPICalls(ioc);
+  const apiResults = await Promise.allSettled(promises);
+
+  processAPIResults(apiResults, results, iocValue, iocType);
+  consolidateResults(results, iocValue, iocType, ioc);
+
+  console.log('[Enrichment] Résultats consolidés:', results);
+  return results;
+}
+
+function buildAPICalls(ioc) {
+  const iocValue = ioc.value;
+  const iocType = ioc.type;
+  const promises = [];
+
+  console.log(`[buildAPICalls v2.0] Building calls for ${iocType}: ${iocValue}`);
+  Logger.log('ENRICHMENT', `[v2.0] buildAPICalls started`, { iocType, iocValue });
+
+  for (const [apiName, spec] of Object.entries(API_REGISTRY)) {
+    // Log why API is skipped for better debugging
+    if (!spec.supports.includes(iocType)) {
+      console.log(`[Enrichment v2.0] Skipping ${apiName} - does not support ${iocType} (supports: ${spec.supports.join(', ')})`);
+      Logger.log('ENRICHMENT', `[v2.0] Skipping ${apiName} - unsupported IOC type`, { api: apiName, iocType, supports: spec.supports });
+      continue;
+    }
+
+    if (!API_CONFIG.modules[apiName]?.enabled) {
+      console.log(`[Enrichment v2.0] Skipping ${apiName} - disabled in config`);
+      Logger.log('ENRICHMENT', `[v2.0] Skipping ${apiName} - disabled`, { api: apiName });
+      continue;
+    }
+
+    // Skip APIs that require a key but don't have one configured
+    const config = API_CONFIG.modules[apiName];
+    if (spec.requiresKey && !config.key) {
+      console.log(`[Enrichment v2.0] Skipping ${apiName} - API key required but not configured`);
+      Logger.log('ENRICHMENT', `[v2.0] Skipping ${apiName} - no API key`, { api: apiName, requiresKey: true });
+      continue;
+    }
+
+    console.log(`[Enrichment v2.0] Calling ${apiName} for ${iocType}: ${iocValue}`);
+    Logger.log('ENRICHMENT', `[v2.0] Calling ${apiName}`, { api: apiName, iocType, iocValue });
+
+    promises.push(
+      callAPI(apiName, ioc)
+        .then(data => ({ status: 'success', api: apiName, data }))
+        .catch(error => ({ status: 'error', api: apiName, error }))
+    );
+  }
+
+  console.log(`[Enrichment] Built ${promises.length} API calls for ${iocType}`);
+  Logger.log('ENRICHMENT', `Built API calls`, { count: promises.length, iocType });
+
+  return promises;
+}
+
+function processAPIResults(apiResults, results, iocValue, iocType) {
+  apiResults.forEach(promiseResult => {
+    if (promiseResult.status === 'fulfilled') {
+      const result = promiseResult.value;
+
+      if (result.status === 'success') {
+        const { api, data } = result;
+        const spec = API_REGISTRY[api];
+
+        // Add external link for all APIs that were called
+        results.externalLinks.push({
+          name: spec.name,
+          url: spec.buildWebUrl(iocValue, iocType),
+          icon: spec.icon
+        });
+
+        // Only process data if we got some (data can be null for "no information available")
+        if (data) {
+          results.apiResults[api] = data;
+          results.sources.push(spec.name);
+        }
+      } else if (result.status === 'error') {
+        const { api, error } = result;
+        const spec = API_REGISTRY[api];
+
+        // Add external link even for failed APIs
+        if (spec) {
+          results.externalLinks.push({
+            name: spec.name,
+            url: spec.buildWebUrl(iocValue, iocType),
+            icon: spec.icon
+          });
+        }
+
+        // Check if this is an expected error (API limitations, rate limits, etc.)
+        const errorMsg = error.message?.toLowerCase() || '';
+        const isExpectedError = errorMsg.includes('api key') ||
+                                errorMsg.includes('rate limit') ||
+                                errorMsg.includes('membership') ||
+                                errorMsg.includes('upgrade') ||
+                                errorMsg.includes('quota');
+
+        // Only log unexpected errors to console (expected errors are still added to apiErrors for UI display)
+        if (!isExpectedError) {
+          console.error(`[${api}] Error:`, error);
+        }
+
+        // Always add to apiErrors for UI display
+        results.apiErrors.push({
+          api: api,
+          error: error.message || 'Unexpected error'
+        });
+      }
+    }
+  });
+}
+
+function consolidateResults(results, iocValue, iocType, ioc) {
+  if (iocType === 'ipv4') {
+    results.geolocation = extractGeolocation(results.apiResults);
+  }
+
+  results.technical = extractTechnical(results.apiResults, iocType);
+  results.reputation = calculateReputation(results.apiResults, iocType, results.apiErrors);
+  results.threats = extractThreats(results.apiResults);
+  results.tags = extractTags(results.apiResults);
+}
+
+// ============================================================================
+// DATA EXTRACTION
+// ============================================================================
+
+const extractGeolocation = (apiResults) => {
+  const geo = {};
+
+  if (apiResults.ipapi) {
+    const d = apiResults.ipapi;
+    Object.assign(geo, {
+      country: d.country, countryCode: d.countryCode, region: d.regionName || d.region,
+      city: d.city, coordinates: `${d.lat}, ${d.lon}`, timezone: d.timezone,
+      isp: d.isp, org: d.org, asn: d.as, asnName: d.asname
+    });
+  }
+
+  if (apiResults.ipapiCo) {
+    const d = apiResults.ipapiCo;
+    const fallbacks = {
+      country: d.country_name, countryCode: d.country_code, region: d.region,
+      city: d.city, coordinates: d.latitude && d.longitude ? `${d.latitude}, ${d.longitude}` : null,
+      timezone: d.timezone, isp: d.org, org: d.org, asn: d.asn ? `AS${d.asn}` : null
+    };
+    for (const [key, val] of Object.entries(fallbacks)) {
+      if (!geo[key] && val) geo[key] = val;
+    }
+    if (d.currency) geo.currency = d.currency;
+    if (d.languages) geo.languages = d.languages;
+  }
+
+  return Object.keys(geo).length > 0 ? geo : null;
+};
+
+const extractTechnical = (apiResults, iocType) => {
+  const tech = { firstSeen: null, firstSeenSource: null };
+
+  const dates = [];
+
+  // Collect dates from various APIs
+  if (apiResults.virustotal?.attributes?.first_submission_date) {
+    dates.push({
+      timestamp: apiResults.virustotal.attributes.first_submission_date * 1000,
+      source: 'VirusTotal'
+    });
+  }
+  if (apiResults.abuseipdb?.lastReportedAt) {
+    dates.push({
+      timestamp: new Date(apiResults.abuseipdb.lastReportedAt).getTime(),
+      source: 'AbuseIPDB'
+    });
+  }
+  if (apiResults.urlhaus?.firstseen) {
+    dates.push({
+      timestamp: new Date(apiResults.urlhaus.firstseen).getTime(),
+      source: 'URLhaus'
+    });
+  }
+  if (apiResults.urlhaus?.firstseen_utc) {
+    dates.push({
+      timestamp: new Date(apiResults.urlhaus.firstseen_utc).getTime(),
+      source: 'URLhaus'
+    });
+  }
+  if (apiResults.threatfox?.data && Array.isArray(apiResults.threatfox.data) && apiResults.threatfox.data.length > 0) {
+    apiResults.threatfox.data.forEach(ioc => {
+      if (ioc.first_seen) {
+        dates.push({
+          timestamp: new Date(ioc.first_seen).getTime(),
+          source: 'ThreatFox'
+        });
+      }
+    });
+  }
+
+  // Get oldest date
+  if (dates.length > 0) {
+    const oldest = dates.reduce((min, curr) => curr.timestamp < min.timestamp ? curr : min);
+    tech.firstSeen = new Date(oldest.timestamp);
+    tech.firstSeenSource = oldest.source;
+  }
+
+  // Add IPv4-specific data
+  if (iocType === 'ipv4') {
+    if (apiResults.ipapi) {
+      const { proxy, hosting, mobile, reverse } = apiResults.ipapi;
+      Object.assign(tech, { proxy: proxy || false, hosting: hosting || false, mobile: mobile || false, reverse });
+    }
+    if (apiResults.shodan) {
+      const { ports, hostnames, os } = apiResults.shodan;
+      Object.assign(tech, { ports, hostnames, os });
+    }
+  }
+
+  return tech;
+};
+
+const extractThreats = (apiResults) => {
+  const threats = [];
+
+  if (apiResults.virustotal?.attributes?.last_analysis_stats?.malicious > 0) {
+    const stats = apiResults.virustotal.attributes.last_analysis_stats;
+    const total = (stats.malicious || 0) + (stats.suspicious || 0) + (stats.undetected || 0) + (stats.harmless || 0);
+    threats.push({ type: 'Malware Detection', description: `${stats.malicious}/${total} security vendors flagged as malicious`, severity: 'critical', source: 'VirusTotal' });
+  }
+
+  if (apiResults.abuseipdb?.abuseConfidenceScore > 75) {
+    const { abuseConfidenceScore, totalReports } = apiResults.abuseipdb;
+    threats.push({ type: 'High Abuse Score', description: `Confidence: ${abuseConfidenceScore}% - ${totalReports} reports`, severity: 'high', source: 'AbuseIPDB' });
+  }
+
+  if (apiResults.greynoise?.classification === 'malicious') {
+    threats.push({ type: 'Malicious Scanner', description: apiResults.greynoise.name || 'Classified as malicious by GreyNoise', severity: 'high', source: 'GreyNoise' });
+  }
+
+  if (apiResults.shodan?.vulns) {
+    const vulnCount = Object.keys(apiResults.shodan.vulns).length;
+    if (vulnCount > 0) threats.push({ type: 'Known Vulnerabilities', description: `${vulnCount} CVEs detected`, severity: 'high', source: 'Shodan' });
+  }
+
+  if (apiResults.urlhaus?.query_status === 'ok') {
+    if (apiResults.urlhaus.urlhaus_reference) {
+      threats.push({ type: 'Malware Distribution', description: 'Domain listed in URLhaus malware URL database', severity: 'critical', source: 'URLhaus' });
+    } else if (apiResults.urlhaus.sha256_hash) {
+      const signature = apiResults.urlhaus.signature || 'Unknown malware';
+      threats.push({ type: 'Malicious File', description: `File hash found in URLhaus database: ${signature}`, severity: 'critical', source: 'URLhaus' });
+    }
+  }
+
+  return threats;
+};
+
+function extractTags(apiResults) {
+  const tags = {
+    malwareFamilies: new Set(),
+    threatTypes: new Set(),
+    categories: new Set(),
+    generalTags: new Set(),
+    attackIds: new Set()
+  };
+
+  // VirusTotal tags only (categories are verdicts, not attack categories)
+  if (apiResults.virustotal?.attributes) {
+    const vt = apiResults.virustotal.attributes;
+    if (vt.tags && Array.isArray(vt.tags)) {
+      vt.tags.forEach(tag => tags.generalTags.add(tag));
+    }
+  }
+
+  // AbuseIPDB categories
+  if (apiResults.abuseipdb?.reports && Array.isArray(apiResults.abuseipdb.reports)) {
+    const categoryMap = {
+      1: 'DNS Compromise', 2: 'DNS Poisoning', 3: 'Fraud Orders',
+      4: 'DDoS Attack', 5: 'FTP Brute-Force', 6: 'Ping of Death',
+      7: 'Phishing', 8: 'Fraud VoIP', 9: 'Open Proxy',
+      10: 'Web Spam', 11: 'Email Spam', 12: 'Blog Spam',
+      13: 'VPN IP', 14: 'Port Scan', 15: 'Hacking',
+      16: 'SQL Injection', 17: 'Spoofing', 18: 'Brute-Force',
+      19: 'Bad Web Bot', 20: 'Exploited Host', 21: 'Web App Attack',
+      22: 'SSH', 23: 'IoT Targeted'
+    };
+    apiResults.abuseipdb.reports.forEach(report => {
+      if (report.categories && Array.isArray(report.categories)) {
+        report.categories.forEach(catId => {
+          if (categoryMap[catId]) {
+            tags.categories.add(categoryMap[catId]);
+          }
+        });
+      }
+    });
+  }
+
+  // GreyNoise tags
+  if (apiResults.greynoise?.tags && Array.isArray(apiResults.greynoise.tags)) {
+    apiResults.greynoise.tags.forEach(tag => tags.generalTags.add(tag));
+  }
+
+  // Shodan tags
+  if (apiResults.shodan) {
+    if (apiResults.shodan.tags && Array.isArray(apiResults.shodan.tags)) {
+      apiResults.shodan.tags.forEach(tag => tags.generalTags.add(tag));
+    }
+  }
+
+  // URLhaus tags, threat, and malware families
+  if (apiResults.urlhaus?.urls && Array.isArray(apiResults.urlhaus.urls)) {
+    apiResults.urlhaus.urls.forEach(url => {
+      if (url.tags && Array.isArray(url.tags)) {
+        url.tags.forEach(tag => tags.generalTags.add(tag));
+      }
+      if (url.threat) {
+        tags.threatTypes.add(url.threat);
+      }
+      if (url.payloads && Array.isArray(url.payloads)) {
+        url.payloads.forEach(payload => {
+          if (payload.malware_family) {
+            tags.malwareFamilies.add(payload.malware_family);
+          }
+        });
+      }
+    });
+  }
+
+  // ThreatFox malware families, threat types, and tags
+  if (apiResults.threatfox?.data && Array.isArray(apiResults.threatfox.data)) {
+    apiResults.threatfox.data.forEach(ioc => {
+      if (ioc.malware_printable) {
+        tags.malwareFamilies.add(ioc.malware_printable);
+      }
+      if (ioc.malware_alias && typeof ioc.malware_alias === 'string') {
+        // Split comma-separated aliases
+        ioc.malware_alias.split(',').forEach(alias => {
+          if (alias.trim()) tags.malwareFamilies.add(alias.trim());
+        });
+      }
+      if (ioc.threat_type_desc) {
+        tags.threatTypes.add(ioc.threat_type_desc);
+      }
+      if (ioc.tags && Array.isArray(ioc.tags)) {
+        ioc.tags.forEach(tag => tags.generalTags.add(tag));
+      }
+    });
+  }
+
+  // AlienVault OTX tags, malware families, and MITRE ATT&CK
+  if (apiResults.otx?.pulse_info?.pulses && Array.isArray(apiResults.otx.pulse_info.pulses)) {
+    apiResults.otx.pulse_info.pulses.forEach(pulse => {
+      if (pulse.tags && Array.isArray(pulse.tags)) {
+        pulse.tags.forEach(tag => tags.generalTags.add(tag));
+      }
+      if (pulse.malware_families && Array.isArray(pulse.malware_families)) {
+        pulse.malware_families.forEach(family => {
+          // malware_families can be objects with display_name or strings
+          if (typeof family === 'object' && family !== null) {
+            const familyName = family.display_name || family.name || JSON.stringify(family);
+            if (familyName) tags.malwareFamilies.add(familyName);
+          } else if (typeof family === 'string') {
+            tags.malwareFamilies.add(family);
+          }
+        });
+      }
+      if (pulse.attack_ids && Array.isArray(pulse.attack_ids)) {
+        pulse.attack_ids.forEach(id => {
+          // attack_ids can be objects with id and name properties or strings
+          if (typeof id === 'object' && id !== null) {
+            // Format: "T1234: Technique Name" or just "T1234" if no name
+            const attackId = id.id || id.attack_id;
+            const attackName = id.name || id.display_name;
+            if (attackId && attackName) {
+              tags.attackIds.add(`${attackId}: ${attackName}`);
+            } else if (attackId) {
+              tags.attackIds.add(attackId);
+            }
+          } else if (typeof id === 'string') {
+            tags.attackIds.add(id);
+          }
+        });
+      }
+    });
+  }
+
+  // Convert Sets to sorted arrays
+  return {
+    malwareFamilies: Array.from(tags.malwareFamilies).sort(),
+    threatTypes: Array.from(tags.threatTypes).sort(),
+    categories: Array.from(tags.categories).sort(),
+    generalTags: Array.from(tags.generalTags).sort(),
+    attackIds: Array.from(tags.attackIds).sort()
+  };
+}
+
+// ============================================================================
+// COVERAGE CALCULATION - Data Completeness Assessment
+// ============================================================================
+
+/**
+ * Calculates coverage metrics for API sources to assess data completeness.
+ * This is critical for confidence adjustment - a verdict based on 3/10 sources
+ * should have lower confidence than the same verdict based on 10/10 sources.
+ */
+function calculateCoverage(apiResults, apiErrors, iocType) {
+  const geoOnlyAPIs = ['ipapi', 'ipapiCo'];
+  let configuredCount = 0;
+  let successfulCount = 0;
+  let failedCount = 0;
+  const missingCriticalAPIs = [];
+  let missingWeight = 0;
+
+  // Critical APIs that should always be checked when available
+  const criticalAPINames = ['virustotal', 'urlhaus', 'threatfox'];
+
+  // Count all APIs that should have been queried for this IOC type
+  for (const [apiName, spec] of Object.entries(API_REGISTRY)) {
+    // Skip geolocation-only APIs
+    if (geoOnlyAPIs.includes(apiName)) {
+      continue;
+    }
+
+    // Skip APIs that don't support this IOC type
+    if (!spec.supports.includes(iocType)) {
+      continue;
+    }
+
+    // Skip APIs that are not enabled
+    const config = API_CONFIG.modules[apiName];
+    if (!config?.enabled) {
+      continue;
+    }
+
+    // Skip APIs that require a key but don't have one
+    if (spec.requiresKey && !config.key) {
+      continue;
+    }
+
+    // This API should have been queried
+    configuredCount++;
+
+    // Check if it succeeded
+    const apiData = apiResults[apiName];
+    if (apiData) {
+      successfulCount++;
+    } else {
+      // This API failed or returned no data
+      failedCount++;
+
+      const weight = spec.weight || 1.0;
+      missingWeight += weight;
+
+      // Track missing critical APIs
+      if (criticalAPINames.includes(apiName) && weight >= 2.0) {
+        missingCriticalAPIs.push({
+          api: apiName,
+          name: spec.name,
+          weight: weight
+        });
+      }
+    }
+  }
+
+  const coverageRate = configuredCount > 0 ? successfulCount / configuredCount : 0;
+
+  return {
+    configured: configuredCount,
+    successful: successfulCount,
+    failed: failedCount,
+    coverageRate: Math.round(coverageRate * 100) / 100, // Round to 2 decimals
+    missingCriticalAPIs,
+    missingWeight: Math.round(missingWeight * 10) / 10, // Round to 1 decimal
+    hasCriticalGaps: missingCriticalAPIs.length > 0
+  };
+}
+
+/**
+ * Adjusts confidence level based on data coverage.
+ * A verdict with HIGH confidence but only 30% source coverage should be
+ * downgraded to MEDIUM or LOW to reflect the incomplete information.
+ */
+function adjustConfidenceForCoverage(baseConfidence, coverage) {
+  // If all configured APIs responded, no adjustment needed
+  if (coverage.coverageRate >= 0.95) {
+    return baseConfidence;
+  }
+
+  // Critical downgrade: Missing critical high-weight APIs (VT, URLhaus, ThreatFox)
+  if (coverage.hasCriticalGaps) {
+    // If we're missing critical sources, HIGH confidence is never appropriate
+    if (baseConfidence === 'HIGH') {
+      return 'MEDIUM';
+    }
+    // If coverage is also poor (< 50%) and we're missing critical sources, downgrade MEDIUM to LOW
+    if (baseConfidence === 'MEDIUM' && coverage.coverageRate < 0.5) {
+      return 'LOW';
+    }
+  }
+
+  // Severe coverage gap (< 30% of sources responded)
+  if (coverage.coverageRate < 0.3) {
+    // Always downgrade to LOW confidence when < 30% sources available
+    return 'LOW';
+  }
+
+  // Moderate coverage gap (30-50% of sources responded)
+  if (coverage.coverageRate < 0.5) {
+    // Downgrade HIGH → MEDIUM, keep MEDIUM and LOW as-is
+    if (baseConfidence === 'HIGH') {
+      return 'MEDIUM';
+    }
+    return baseConfidence;
+  }
+
+  // Minor coverage gap (50-70% of sources responded)
+  if (coverage.coverageRate < 0.7) {
+    // Downgrade HIGH → MEDIUM only if missing critical sources
+    // This is already handled above, so no additional downgrade
+    return baseConfidence;
+  }
+
+  // Good coverage (70-95% of sources responded)
+  // No adjustment needed
+  return baseConfidence;
+}
+
+function calculateReputation(apiResults, iocType, apiErrors = []) {
+  const verdicts = [];
+  const evidence = { malicious: [], suspicious: [], clean: [], unknown: [] };
+
+  // APIs that only provide geolocation/metadata, not reputation
+  const geoOnlyAPIs = ['ipapi', 'ipapiCo'];
+
+  // ============================================================================
+  // PHASE 1: Calculate coverage metrics BEFORE scoring
+  // This gives us visibility into data completeness for confidence adjustment
+  // ============================================================================
+
+  const coverage = calculateCoverage(apiResults, apiErrors, iocType);
+
+  // ============================================================================
+  // PHASE 2: Collect verdicts from successful APIs
+  // ============================================================================
+
+  // Collecter les verdicts de toutes les APIs activées et compatibles
+  for (const [apiName, spec] of Object.entries(API_REGISTRY)) {
+    // Skip geolocation-only APIs
+    if (geoOnlyAPIs.includes(apiName)) {
+      continue;
+    }
+
+    // Skip APIs that don't support this IOC type
+    if (!spec.supports.includes(iocType)) {
+      continue;
+    }
+
+    // Skip APIs that are not enabled
+    const config = API_CONFIG.modules[apiName];
+    if (!config?.enabled) {
+      continue;
+    }
+
+    // Skip APIs that require a key but don't have one
+    if (spec.requiresKey && !config.key) {
+      continue;
+    }
+
+    // Get API data (will be undefined if API call failed or returned no data)
+    const apiData = apiResults[apiName];
+
+    // Skip APIs that failed or returned no data - they shouldn't contribute to reputation
+    if (!apiData) {
+      continue;
+    }
+
+    const verdict = analyzeVerdict(apiName, apiData);
+    verdicts.push({ api: apiName, ...verdict });
+
+    const weight = spec.weight || 1.0;
+    const confidence = weight >= 2.0 ? 'HIGH' : weight >= 1.5 ? 'MEDIUM' : 'LOW';
+
+    evidence[verdict.verdict].push({
+      api: apiName,
+      weight,
+      confidence,
+      detail: verdict.detail,
+      score: verdict.score
+    });
+  }
+
+  // ============================================================================
+  // SIMPLIFIED HIERARCHICAL SCORING - v3.0
+  // Rule-based decision table matching human analyst thinking
+  // ============================================================================
+
+  let status, globalScore, confidence, message;
+
+  // Count sources by category and weight
+  const maliciousCount = evidence.malicious.length;
+  const suspiciousCount = evidence.suspicious.length;
+  const cleanCount = evidence.clean.length;
+  const unknownCount = evidence.unknown.length;
+
+  const maliciousWeight = evidence.malicious.reduce((sum, e) => sum + e.weight, 0);
+  const cleanWeight = evidence.clean.reduce((sum, e) => sum + e.weight, 0);
+
+  // Identify critical and high-confidence sources
+  const criticalSources = evidence.malicious.filter(e =>
+    ['urlhaus', 'threatfox'].includes(e.api)
+  );
+  const highConfidenceSources = evidence.malicious.filter(e => e.weight >= 2.0);
+  const mediumConfidenceSources = evidence.malicious.filter(e => e.weight >= 1.5 && e.weight < 2.0);
+
+  // ============================================================================
+  // DECISION TREE - Evaluated in priority order
+  // ============================================================================
+
+  // RULE 1: Critical source detection (URLhaus/ThreatFox)
+  if (criticalSources.length > 0) {
+    status = 'malicious';
+    globalScore = 100;
+    confidence = 'HIGH';
+    message = `Critical threat detected by ${criticalSources[0].api}`;
+  }
+
+  // RULE 2: Multiple high-confidence sources agree (VirusTotal, AbuseIPDB, URLScan)
+  else if (highConfidenceSources.length >= 2) {
+    status = 'malicious';
+    globalScore = 95;
+    confidence = 'HIGH';
+    message = `${highConfidenceSources.length} high-confidence sources confirm threat`;
+  }
+
+  // RULE 3: Single high-confidence source with confirmation from others
+  else if (highConfidenceSources.length === 1 && maliciousCount >= 2) {
+    status = 'malicious';
+    globalScore = 90;
+    confidence = 'HIGH';
+    message = `High-confidence source confirmed by ${maliciousCount - 1} other source(s)`;
+  }
+
+  // RULE 4: Single high-confidence source alone
+  else if (highConfidenceSources.length === 1) {
+    // Check if contradicted by clean sources
+    if (cleanCount >= 3 && cleanWeight > maliciousWeight) {
+      status = 'suspicious';
+      globalScore = 55;
+      confidence = 'MEDIUM';
+      message = `Conflicting evidence: 1 malicious vs ${cleanCount} clean sources`;
+    } else {
+      status = 'malicious';
+      globalScore = 85;
+      confidence = 'HIGH';
+      message = `Detected by high-confidence source (${highConfidenceSources[0].api})`;
+    }
+  }
+
+  // RULE 5: Multiple medium-confidence sources agree
+  else if (mediumConfidenceSources.length >= 3) {
+    status = 'malicious';
+    globalScore = 80;
+    confidence = 'MEDIUM';
+    message = `${mediumConfidenceSources.length} sources agree on threat`;
+  }
+
+  // RULE 6: Two medium-confidence sources
+  else if (mediumConfidenceSources.length === 2) {
+    status = 'malicious';
+    globalScore = 70;
+    confidence = 'MEDIUM';
+    message = `2 medium-confidence sources flag threat`;
+  }
+
+  // RULE 7: Single medium-confidence source OR multiple low-confidence
+  else if (maliciousCount >= 2) {
+    // Check if heavily contradicted by clean sources
+    if (cleanCount >= 5 && cleanWeight > maliciousWeight * 1.5) {
+      status = 'suspicious';
+      globalScore = 35;
+      confidence = 'LOW';
+      message = `Weak threat signals contradicted by ${cleanCount} clean sources`;
+    } else if (cleanCount >= 3 && cleanWeight > maliciousWeight) {
+      status = 'suspicious';
+      globalScore = 50;
+      confidence = 'MEDIUM';
+      message = `Mixed signals: ${maliciousCount} malicious vs ${cleanCount} clean`;
+    } else {
+      status = 'malicious';
+      globalScore = 65;
+      confidence = 'MEDIUM';
+      message = `${maliciousCount} sources indicate threat`;
+    }
+  }
+
+  // RULE 8: Single malicious source with low confidence
+  else if (maliciousCount === 1) {
+    const singleSource = evidence.malicious[0];
+    if (cleanCount >= 4) {
+      status = 'suspicious';
+      globalScore = 30;
+      confidence = 'LOW';
+      message = `Single source (${singleSource.api}) contradicted by ${cleanCount} clean sources`;
+    } else if (cleanCount >= 2) {
+      status = 'suspicious';
+      globalScore = 45;
+      confidence = 'LOW';
+      message = `Single source detection with conflicting evidence`;
+    } else {
+      status = 'suspicious';
+      globalScore = 60;
+      confidence = 'MEDIUM';
+      message = `Flagged by ${singleSource.api} (needs confirmation)`;
+    }
+  }
+
+  // RULE 9: Only suspicious verdicts, no malicious
+  else if (suspiciousCount >= 2) {
+    status = 'suspicious';
+    globalScore = 50;
+    confidence = 'MEDIUM';
+    message = `${suspiciousCount} sources report suspicious activity`;
+  }
+
+  // RULE 10: Single suspicious verdict
+  else if (suspiciousCount === 1) {
+    status = 'suspicious';
+    globalScore = 35;
+    confidence = 'LOW';
+    message = `Low-level suspicious indicators detected`;
+  }
+
+  // RULE 11: Majority clean verdicts
+  else if (cleanCount >= 2) {
+    status = 'safe';
+    globalScore = 0;
+    confidence = cleanCount >= 4 ? 'HIGH' : 'MEDIUM';
+    message = `${cleanCount} source(s) confirm clean`;
+  }
+
+  // RULE 12: Single clean source
+  else if (cleanCount === 1) {
+    status = 'safe';
+    globalScore = 5;  // Not 0 because confidence is low
+    confidence = 'LOW';
+    message = `No threats detected (limited data)`;
+  }
+
+  // RULE 13: Insufficient data
+  else {
+    status = 'unknown';
+    globalScore = 0;
+    confidence = 'LOW';
+    message = 'Insufficient data for verdict';
+  }
+
+  // ============================================================================
+  // PHASE 4: Adjust confidence based on coverage
+  // This ensures that confidence reflects both verdict quality AND data completeness
+  // ============================================================================
+
+  const originalConfidence = confidence;
+  confidence = adjustConfidenceForCoverage(confidence, coverage);
+
+  // If confidence was downgraded due to coverage, append a note to the message
+  if (confidence !== originalConfidence && coverage.failed > 0) {
+    message += ` (limited coverage: ${coverage.successful}/${coverage.configured} sources)`;
+  }
+
+  // ============================================================================
+  // PHASE 5: Add failed APIs to verdicts for UI display
+  // ============================================================================
+
+  // Add failed APIs to verdicts list with "error" status for display purposes
+  apiErrors.forEach(error => {
+    verdicts.push({
+      api: error.api,
+      verdict: 'error',
+      score: 0,
+      detail: error.error.replace(/\s+/g, ' ').trim()  // Normalize whitespace (remove newlines)
+    });
+  });
+
+  return { score: globalScore, status, message, confidence, verdicts, evidence, coverage };
+}
+
+function analyzeVerdict(apiName, apiData) {
+  if (!apiData) return { verdict: 'unknown', score: 0, detail: 'No data' };
+
+  const analyzer = VERDICT_RULES[apiName];
+  return analyzer ? analyzer(apiData) : { verdict: 'unknown', score: 0, detail: 'No verdict available' };
+}
+
+// ============================================================================
+// DISPLAY FUNCTIONS
+// ============================================================================
+
+function displayIOC(ioc) {
+  document.getElementById('ioc-text').textContent = ioc.value;
+  document.getElementById('ioc-type').textContent = ioc.type;
+}
+
+async function displayResults(data) {
+  console.log('[Display] Affichage des résultats:', data);
+  Logger.logUI('Displaying results', {
+    sources: data.sources,
+    apiErrorsCount: data.apiErrors?.length || 0,
+    threatsCount: data.threats?.length || 0,
+    reputation: data.reputation?.status
+  });
+
+  showResults();
+
+  // Load display sections settings
+  const { apiConfig } = await chrome.storage.local.get(['apiConfig']);
+  const displaySections = apiConfig?.displaySections || {
+    reputation: true,
+    individualVerdicts: true,
+    geolocation: true,
+    threats: true,
+    tags: true,
+    technicalDetails: true
+  };
+
+  // Display sections based on settings
+  if (data.reputation && displaySections.reputation) {
+    displayReputation(data.reputation, displaySections);
+    document.getElementById('reputation-section')?.classList.remove('hidden');
+  } else {
+    document.getElementById('reputation-section')?.classList.add('hidden');
+  }
+
+  // Display individual verdicts even if reputation section is hidden
+  if (data.reputation?.verdicts?.length > 0 && displaySections.individualVerdicts) {
+    displayAPIVerdicts(data.reputation.verdicts);
+  } else if (!displaySections.individualVerdicts) {
+    document.getElementById('api-verdicts')?.classList.add('hidden');
+  }
+
+  if (data.geolocation && data.ioc.type === 'ipv4' && displaySections.geolocation) {
+    displayGeolocation(data.geolocation);
+  } else {
+    document.getElementById('geo-section')?.classList.add('hidden');
+  }
+
+  if (data.threats?.length > 0 && displaySections.threats) {
+    displayThreats(data.threats);
+  } else {
+    document.getElementById('threats-section')?.classList.add('hidden');
+  }
+
+  if (data.tags && displaySections.tags) {
+    displayTags(data.tags);
+  } else {
+    document.getElementById('tags-section')?.classList.add('hidden');
+  }
+
+  if (displaySections.technicalDetails) {
+    displayTechnicalDetails(data.technical, data.ioc);
+  } else {
+    document.querySelector('.section:has(#technical-details)')?.classList.add('hidden');
+  }
+
+  displayExternalLinks(data.externalLinks || []);
+
+  const sourcesList = document.getElementById('sources-list');
+  sourcesList.textContent = data.sources?.length > 0 ? data.sources.join(', ') : 'None';
+
+  const timestamp = data.timestamp ? new Date(data.timestamp).toLocaleString() : 'now';
+  document.getElementById('last-updated').textContent = timestamp;
+
+  window.currentEnrichmentData = data;
+}
+
+function displayAPIWarnings(apiErrors) {
+  const warningsDiv = document.getElementById('api-warnings');
+  const warningsList = document.getElementById('api-warnings-list');
+
+  warningsList.innerHTML = apiErrors.map(err =>
+    `<div class="warning-item"><strong>${escapeHtml(err.api.toUpperCase())}</strong>: ${escapeHtml(err.error)}</div>`
+  ).join('');
+
+  warningsDiv.classList.remove('hidden');
+}
+
+function displayReputation(reputation, displaySections) {
+  const indicator = document.getElementById('reputation-indicator');
+  const text = document.getElementById('reputation-text');
+
+  indicator.className = 'indicator';
+
+  // Badge configuration with icons and colors
+  const badgeConfig = {
+    malicious: { icon: '🚨', text: 'THREAT DETECTED', bg: '#f44336', color: '#fff' },
+    suspicious: { icon: '⚠️', text: 'SUSPICIOUS', bg: '#ff9800', color: '#fff' },
+    safe: { icon: '✓', text: 'CLEAN', bg: '#4caf50', color: '#fff' },
+    clean: { icon: '✓', text: 'CLEAN', bg: '#4caf50', color: '#fff' },
+    unknown: { icon: '?', text: 'YOU ARE BLIND', bg: '#9e9e9e', color: '#fff' }
+  };
+
+  if (!reputation) {
+    const config = badgeConfig.unknown;
+    indicator.innerHTML = `
+      <div class="verdict-badge" style="background: ${config.bg}; color: ${config.color}; padding: 16px 24px; border-radius: 8px; display: flex; align-items: center; gap: 12px; font-size: 1.2em; font-weight: 700;">
+        <span style="font-size: 1.5em;">${config.icon}</span>
+        <span>${config.text}</span>
+      </div>
+    `;
+    text.innerHTML = '<div class="reputation-message">No security vendors checked</div>';
+    return;
+  }
+
+  const config = badgeConfig[reputation.status] || badgeConfig.unknown;
+
+  indicator.innerHTML = `
+    <div class="verdict-badge" style="background: ${config.bg}; color: ${config.color}; padding: 16px 24px; border-radius: 8px; display: flex; align-items: center; gap: 12px; font-size: 1.2em; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+      <span style="font-size: 1.5em;">${config.icon}</span>
+      <span>${config.text}</span>
+    </div>
+  `;
+
+  // Build coverage warning if applicable
+  let coverageWarning = '';
+  if (reputation.coverage && reputation.coverage.failed > 0) {
+    const coveragePercent = Math.round(reputation.coverage.coverageRate * 100);
+    const warningClass = coveragePercent < 50 ? 'coverage-warning-severe' : 'coverage-warning-moderate';
+
+    coverageWarning = `<div class="${warningClass}" style="margin-top: 8px; padding: 6px 10px; background: rgba(255, 152, 0, 0.1); border-left: 3px solid #ff9800; border-radius: 3px; font-size: 0.85em;">
+      <div style="font-weight: 600; color: #ff9800;">⚠️ Data Coverage: ${reputation.coverage.successful}/${reputation.coverage.configured} sources (${coveragePercent}%)</div>
+    </div>`;
+
+    // If critical APIs are missing, highlight that
+    if (reputation.coverage.hasCriticalGaps) {
+      const criticalNames = reputation.coverage.missingCriticalAPIs.map(a => a.name).join(', ');
+      coverageWarning += `<div style="margin-top: 4px; padding: 6px 10px; background: rgba(244, 67, 54, 0.1); border-left: 3px solid #f44336; border-radius: 3px; font-size: 0.8em;">
+        <div style="font-weight: 600; color: #f44336;">🚨 Missing critical sources: ${escapeHtml(criticalNames)}</div>
+      </div>`;
+    }
+  }
+
+  text.innerHTML = `
+    <div class="reputation-message" style="margin-top: 12px; font-size: 0.95em;">
+      ${escapeHtml(reputation.message)}
+    </div>
+    ${coverageWarning}
+  `;
+
+  // Don't call displayAPIVerdicts here - it's called separately in displayResults
+}
+
+function displayAPIVerdicts(verdicts) {
+  const verdictsSection = document.getElementById('api-verdicts');
+  const verdictsList = document.getElementById('api-verdicts-list');
+
+  const verdictIcons = {
+    malicious: '✗',
+    suspicious: '⚠',
+    clean: '✓',
+    unknown: '?',
+    error: '✗'
+  };
+
+  verdictsList.innerHTML = verdicts.map(v => `<div class="api-verdict-item ${escapeHtml(v.verdict)}" role="listitem" aria-label="${escapeHtml(API_REGISTRY[v.api]?.name || v.api)}: ${escapeHtml(v.verdict)}"><div class="api-verdict-name">${escapeHtml(API_REGISTRY[v.api]?.name || v.api)}</div><div class="api-verdict-score"><span class="api-verdict-detail">${escapeHtml(v.detail)}</span><span class="api-verdict-badge ${escapeHtml(v.verdict)}" aria-label="${escapeHtml(v.verdict)} verdict">${verdictIcons[v.verdict]} ${escapeHtml(v.verdict)}</span></div></div>`).join('');
+
+  verdictsSection.classList.remove('hidden');
+}
+
+function displayGeolocation(geo) {
+  const section = document.getElementById('geo-section');
+  section.classList.remove('hidden');
+
+  document.getElementById('geo-country').textContent = geo.country ? `${geo.country} (${geo.countryCode})` : '-';
+  document.getElementById('geo-city').textContent = geo.city || '-';
+  document.getElementById('geo-region').textContent = geo.region || '-';
+  document.getElementById('geo-isp').textContent = geo.isp || '-';
+  document.getElementById('geo-asn').textContent = geo.asn || '-';
+  document.getElementById('geo-org').textContent = geo.org || '-';
+}
+
+function displayThreats(threats) {
+  const section = document.getElementById('threats-section');
+  const list = document.getElementById('threats-list');
+
+  section.classList.remove('hidden');
+  list.innerHTML = threats.map(threat => `
+    <div class="threat-item">
+      <strong>${escapeHtml(threat.type)}</strong>
+      ${escapeHtml(threat.description)}
+      <div class="threat-meta">
+        Severity: ${escapeHtml(threat.severity)} | Source: ${escapeHtml(threat.source)}
+      </div>
+    </div>
+  `).join('');
+}
+
+function displayTags(tags) {
+  const section = document.getElementById('tags-section');
+  const tagsData = [
+    { containerId: 'malware-families-container', listId: 'malware-families-list', data: tags.malwareFamilies, cssClass: 'tag-malware' },
+    { containerId: 'threat-types-container', listId: 'threat-types-list', data: tags.threatTypes, cssClass: 'tag-threat' },
+    { containerId: 'categories-container', listId: 'categories-list', data: tags.categories, cssClass: 'tag-category-item' },
+    { containerId: 'attack-ids-container', listId: 'attack-ids-list', data: tags.attackIds, cssClass: 'tag-attack' },
+    { containerId: 'general-tags-container', listId: 'general-tags-list', data: tags.generalTags, cssClass: 'tag-general' }
+  ];
+
+  let hasAnyTags = false;
+
+  tagsData.forEach(({ containerId, listId, data, cssClass }) => {
+    const container = document.getElementById(containerId);
+    const list = document.getElementById(listId);
+
+    if (data && data.length > 0) {
+      hasAnyTags = true;
+      container.classList.remove('hidden');
+
+      // SECURITY: Use escapeHtml to prevent XSS
+      list.innerHTML = data.map(item =>
+        `<span class="tag ${escapeHtml(cssClass)}">${escapeHtml(item)}</span>`
+      ).join('');
+    } else {
+      container.classList.add('hidden');
+    }
+  });
+
+  if (hasAnyTags) {
+    section.classList.remove('hidden');
+  } else {
+    section.classList.add('hidden');
+  }
+}
+
+function displayTechnicalDetails(technical, ioc) {
+  if (technical?.firstSeen && technical?.firstSeenSource) {
+    // Handle both Date objects and date strings (from cache)
+    let dateStr;
+    if (technical.firstSeen instanceof Date) {
+      dateStr = technical.firstSeen.toLocaleString();
+    } else if (typeof technical.firstSeen === 'string' || typeof technical.firstSeen === 'number') {
+      // Date was serialized to string/number in cache, convert back
+      dateStr = new Date(technical.firstSeen).toLocaleString();
+    } else {
+      dateStr = String(technical.firstSeen);
+    }
+    document.getElementById('tech-first-seen').textContent = `${dateStr} (${technical.firstSeenSource})`;
+  } else {
+    document.getElementById('tech-first-seen').textContent = '-';
+  }
+}
+
+function displayExternalLinks(links) {
+  let linksSection = document.getElementById('external-links-section');
+
+  if (!linksSection) {
+    linksSection = document.createElement('div');
+    linksSection.id = 'external-links-section';
+    linksSection.className = 'section';
+    linksSection.innerHTML = `
+      <div class="section-header-with-action">
+        <h2>🔗 External Resources</h2>
+        <button id="open-all-links" class="btn-open-all hidden">🚀 Open All</button>
+      </div>
+      <div id="external-links-list" class="external-links"></div>
+    `;
+
+    const actionsDiv = document.querySelector('.actions');
+    actionsDiv.parentNode.insertBefore(linksSection, actionsDiv);
+  }
+
+  const linksList = document.getElementById('external-links-list');
+  const openAllBtn = document.getElementById('open-all-links');
+
+  if (!links || links.length === 0) {
+    linksSection.classList.add('hidden');
+    return;
+  }
+
+  linksList.innerHTML = '';
+
+  links.forEach(link => {
+    const linkBtn = document.createElement('a');
+    linkBtn.href = link.url;
+    linkBtn.className = 'external-link-btn';
+    linkBtn.rel = 'noopener noreferrer';
+    linkBtn.textContent = `${link.icon} ${link.name}`;
+    linkBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      chrome.tabs.create({ url: link.url, active: false });
+    });
+    linksList.appendChild(linkBtn);
+  });
+
+  // Show "Open All" button and attach event listener
+  if (openAllBtn) {
+    openAllBtn.classList.remove('hidden');
+    // Remove any existing listeners to avoid duplicates
+    const newBtn = openAllBtn.cloneNode(true);
+    openAllBtn.parentNode.replaceChild(newBtn, openAllBtn);
+
+    newBtn.addEventListener('click', () => {
+      links.forEach(link => {
+        chrome.tabs.create({ url: link.url, active: false });
+      });
+    });
+  }
+
+  linksSection.classList.remove('hidden');
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
+
+async function generateSHA256(text) {
+  // Use Web Crypto API to generate SHA-256 hash
+  const encoder = new TextEncoder();
+  const data = encoder.encode(text);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return hashHex;
+}
+
+// Storage operations with timeout protection
+async function safeStorageGet(keys, timeoutMs = 5000) {
+  let timeoutHandle;
+  try {
+    return await Promise.race([
+      chrome.storage.local.get(keys),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`Storage get operation timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+async function safeStorageSet(data, timeoutMs = 5000) {
+  if (!data || typeof data !== 'object') {
+    throw new Error('Invalid data provided to safeStorageSet');
+  }
+
+  // SECURITY: Validate data size before storage to prevent DoS via storage exhaustion
+  // Chrome's chrome.storage.local has ~10MB quota (depends on browser)
+  // We limit individual items to 5MB to be conservative
+  const dataSize = new Blob([JSON.stringify(data)]).size;
+  const MAX_STORAGE_SIZE = 5 * 1024 * 1024; // 5MB per item
+
+  if (dataSize > MAX_STORAGE_SIZE) {
+    const sizeMB = (dataSize / 1024 / 1024).toFixed(2);
+    throw new Error(`Data too large for storage: ${sizeMB}MB (max: 5MB). This could indicate malicious API response or memory exhaustion attack.`);
+  }
+
+  let timeoutHandle;
+  try {
+    return await Promise.race([
+      chrome.storage.local.set(data),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`Storage set operation timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+async function safeStorageRemove(keys, timeoutMs = 5000) {
+  if (!keys || (Array.isArray(keys) && keys.length === 0)) {
+    throw new Error('No keys provided to safeStorageRemove');
+  }
+  let timeoutHandle;
+  try {
+    return await Promise.race([
+      chrome.storage.local.remove(keys),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new Error(`Storage remove operation timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
+async function copyJSON() {
+  if (!window.currentEnrichmentData) {
+    showError('No data to copy');
+    return;
+  }
+
+  try {
+    const json = JSON.stringify(window.currentEnrichmentData, null, 2);
+    await navigator.clipboard.writeText(json);
+
+    const btn = document.getElementById('copy-json');
+    const originalText = btn.textContent;
+    btn.textContent = '✓ Copied!';
+    btn.style.background = '#00aa00';
+
+    setTimeout(() => {
+      btn.textContent = originalText;
+      btn.style.background = '';
+    }, 2000);
+
+  } catch (error) {
+    console.error('[Copy] Error:', error);
+    showError('Failed to copy data');
+  }
+}
+
+async function refreshData() {
+  try {
+    console.log('[Refresh] Starting refresh - clearing cache...');
+    const data = await safeStorageGet(['currentIOC']);
+
+    if (!data.currentIOC) {
+      throw new Error('No IOC data available to refresh');
+    }
+
+    // Validate IOC data BEFORE accessing properties
+    if (!data.currentIOC.value || !data.currentIOC.type) {
+      throw new Error('Invalid IOC data - missing value or type');
+    }
+
+    const normalizedValue = data.currentIOC.value.toLowerCase().trim();
+    const hash = await generateSHA256(normalizedValue);
+    const cacheKey = `enrichment_${data.currentIOC.type}_${hash}`;
+    console.log('[Refresh] Removing cache:', cacheKey);
+    await safeStorageRemove([cacheKey]);
+    console.log('[Refresh] Cache cleared, restarting enrichment...');
+    await enrichIOC(data.currentIOC);
+  } catch (error) {
+    console.error('[Refresh] Error during refresh:', error);
+    await Logger.log('ERROR', 'Refresh failed', { error: error.message, stack: error.stack });
+    showError('Failed to refresh data. Please try again.');
+  }
+}
+
+async function getCachedData(key) {
+  // Use the key as-is (already namespaced from enrichIOC)
+  const result = await safeStorageGet([key]);
+
+  if (result[key]) {
+    const cached = result[key];
+    const age = Date.now() - cached.timestamp;
+
+    if (age < 5 * 60 * 1000) return cached.data;
+  }
+
+  return null;
+}
+
+async function cacheData(key, data) {
+  // Use the key as-is (already namespaced from enrichIOC)
+  await safeStorageSet({
+    [key]: { data, timestamp: Date.now() }
+  });
+
+  cleanupExpiredCache();
+}
+
+async function cleanupExpiredCache() {
+  try {
+    const allData = await safeStorageGet(null);
+    const now = Date.now();
+    const CACHE_TTL = 5 * 60 * 1000;
+    const MAX_CACHE_ENTRIES = 50;
+
+    const cacheEntries = [];
+    const keysToRemove = [];
+
+    for (const [key, value] of Object.entries(allData)) {
+      // Updated to match new cache key format: enrichment_*
+      if (key.startsWith('enrichment_')) {
+        if (value.timestamp && (now - value.timestamp) > CACHE_TTL) {
+          keysToRemove.push(key);
+        } else if (value.timestamp) {
+          cacheEntries.push({ key, timestamp: value.timestamp });
+        }
+      }
+    }
+
+    if (cacheEntries.length > MAX_CACHE_ENTRIES) {
+      cacheEntries.sort((a, b) => a.timestamp - b.timestamp);
+      const toRemove = cacheEntries.slice(0, cacheEntries.length - MAX_CACHE_ENTRIES);
+      keysToRemove.push(...toRemove.map(e => e.key));
+    }
+
+    if (keysToRemove.length > 0) {
+      await safeStorageRemove(keysToRemove);
+      console.log(`[Cache] Cleanup: ${keysToRemove.length} entries removed`);
+    }
+  } catch (error) {
+    console.error('[Cache] Cleanup error:', error);
+  }
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const { timeout = 5000 } = options;
+
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    if (error.name === 'AbortError') throw new Error('Request timeout');
+    throw error;
+  }
+}
+
+const escapeHtml = (text) => {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+  return String(text).replace(/[&<>"']/g, m => map[m]);
+};
+
+const setVisibility = (id, visible, message = null) => {
+  const el = document.getElementById(id);
+  el.classList[visible ? 'remove' : 'add']('hidden');
+  if (message && id === 'error') document.getElementById('error-message').textContent = message;
+};
+
+const showLoading = () => setVisibility('loading', true);
+const hideLoading = () => setVisibility('loading', false);
+const showError = (msg) => setVisibility('error', true, msg);
+const hideError = () => setVisibility('error', false);
+const showResults = () => setVisibility('results', true);
+const hideResults = () => setVisibility('results', false);
+
+/**
+ * Check if user has PRO access (valid license key)
+ * @returns {Promise<boolean>} true if user has PRO access
+ */
+async function checkProStatus() {
+  try {
+    const result = await safeStorageGet(['proLicenseKey']);
+    return !!result.proLicenseKey;
+  } catch (error) {
+    console.error('[PRO] Failed to check status:', error);
+    return false;
+  }
+}
+
+/**
+ * Update UI based on PRO status
+ */
+function updateUIForProStatus(isProUser) {
+  const proBanner = document.querySelector('.pro-banner');
+  const proStatusBadge = document.getElementById('pro-status');
+
+  if (isProUser) {
+    // Hide upgrade banner for PRO users
+    if (proBanner) proBanner.classList.add('hidden');
+    // Show PRO badge
+    if (proStatusBadge) {
+      proStatusBadge.textContent = '✨ PRO';
+      proStatusBadge.classList.remove('hidden');
+    }
+    console.log('[Popup] User has PRO access');
+  } else {
+    // Show upgrade banner for free users
+    if (proBanner) proBanner.classList.remove('hidden');
+    // Hide PRO badge
+    if (proStatusBadge) proStatusBadge.classList.add('hidden');
+    console.log('[Popup] User on FREE tier (VirusTotal only)');
+  }
+}
+
+/**
+ * Open Gumroad purchase page (placeholder URL)
+ */
+function openGumroadPurchase() {
+  const gumroadURL = 'https://ioclens.gumroad.com/l/dworo';
+  chrome.tabs.create({ url: gumroadURL, active: true });
+  Logger.logUI('Gumroad purchase clicked', { url: gumroadURL });
+}
+
+/**
+ * Activate license key entered by user
+ */
+async function activateLicenseKey() {
+  const input = document.getElementById('license-key-input');
+  const statusDiv = document.getElementById('license-status');
+  const licenseKey = input.value.trim();
+
+  if (!licenseKey) {
+    statusDiv.textContent = '❌ Please enter a license key';
+    statusDiv.className = 'license-status error';
+    return;
+  }
+
+  try {
+    statusDiv.textContent = '⏳ Verifying license...';
+    statusDiv.className = 'license-status loading';
+
+    // Verify license with Gumroad API
+    const isValid = await verifyLicenseWithGumroad(licenseKey);
+
+    if (isValid) {
+      // Store license key
+      await safeStorageSet({ proLicenseKey: licenseKey });
+
+      statusDiv.textContent = '✅ PRO activated! Reloading...';
+      statusDiv.className = 'license-status success';
+
+      await Logger.logUI('PRO license activated', { success: true });
+
+      // Reload extension to apply PRO features
+      setTimeout(() => {
+        location.reload();
+      }, 1500);
+    } else {
+      statusDiv.textContent = '❌ Invalid license key';
+      statusDiv.className = 'license-status error';
+      await Logger.logUI('PRO license activation failed', { success: false, reason: 'invalid key' });
+    }
+  } catch (error) {
+    console.error('[License] Activation error:', error);
+    statusDiv.textContent = `❌ ${error.message}`;
+    statusDiv.className = 'license-status error';
+    await Logger.logUI('PRO license activation error', { success: false, error: error.message });
+  }
+}
+
+/**
+ * Verify license key with Gumroad API (via Vercel endpoint)
+ * @param {string} licenseKey - The license key to verify
+ * @returns {Promise<boolean>} true if valid
+ */
+async function verifyLicenseWithGumroad(licenseKey) {
+  try {
+    const result = await LicenseManager.verifyLicense(licenseKey);
+    return result.valid;
+  } catch (error) {
+    console.error('[License] Verification failed:', error);
+    throw new Error('License verification failed. Please check your connection and try again.');
+  }
+}
+
+// ============================================================================
+// THEME MANAGEMENT
+// ============================================================================
+
+async function loadTheme() {
+  try {
+    const result = await safeStorageGet(['theme']);
+    const theme = result.theme || 'dark'; // Default to dark theme
+    applyTheme(theme);
+  } catch (error) {
+    console.error('[Theme] Failed to load theme:', error);
+    applyTheme('dark'); // Fallback to dark
+  }
+}
+
+async function toggleTheme() {
+  try {
+    const currentTheme = document.body.getAttribute('data-theme') || 'dark';
+    const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+
+    applyTheme(newTheme);
+    await safeStorageSet({ theme: newTheme });
+    await Logger.logUI('Theme changed', { from: currentTheme, to: newTheme });
+  } catch (error) {
+    console.error('[Theme] Failed to toggle theme:', error);
+  }
+}
+
+function applyTheme(theme) {
+  document.body.setAttribute('data-theme', theme);
+
+  const themeIcon = document.querySelector('.theme-icon');
+  if (themeIcon) {
+    themeIcon.textContent = theme === 'dark' ? '☀️' : '🌙';
+  }
+
+  const themeToggleBtn = document.getElementById('theme-toggle');
+  if (themeToggleBtn) {
+    themeToggleBtn.setAttribute('aria-label',
+      theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
+    );
+  }
+}
+
+// Cache bust: 1765636763
